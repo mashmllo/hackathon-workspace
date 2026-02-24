@@ -73,6 +73,7 @@ You have a working DICOM viewer built with Cornerstone3D. Your mission is to imp
 - The Z coordinate comes directly from `<imageZposition>` — it is already in mm.
 - To add annotations programmatically, use `annotation.state.addAnnotation()` from `@cornerstonejs/tools`. See [Cornerstone3D docs](https://www.cornerstonejs.org/docs/).
 - `scripts/parse_lidc_xml.py` shows the XML structure in Python if you want to study it first.
+- Not all annotations in the XML have polygon contours — some are single-point markers. These cannot be displayed as freehand outlines; think about how you would handle or represent them.
 
 ### What to include in your report
 
