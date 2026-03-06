@@ -37,9 +37,11 @@ import {
   RectangleROITool,
   PlanarFreehandROITool,
   annotation,
+  segmentation,
 } from '@cornerstonejs/tools'
-import { Enums as CoreEnums } from '@cornerstonejs/core'
+import { Enums as CoreEnums, metaData, utilities } from '@cornerstonejs/core'
 import { Enums as ToolEnums } from '@cornerstonejs/tools'
+import * as dicomParser from 'dicom-parser'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 type NavTool  = 'WindowLevel' | 'Pan' | 'Zoom'
@@ -62,6 +64,7 @@ export default function App() {
   const [info,        setInfo]        = useState<Info>({ slice: '--', total: '--', wl: '--' })
   const [segments,    setSegments]    = useState<SegmentEntry[]>([])
   const [annotations, setAnnotations] = useState<AnnotationEntry[]>([])
+  const [aiSegPath,   setAiSegPath]   = useState<string | null>(null)
 
   // ── Initialise Cornerstone once the viewport div is mounted ────────────────
   useEffect(() => {
@@ -205,10 +208,24 @@ export default function App() {
   // See HACKATHON_TASKS.md § Task 1 for hints.
   //
   const handleSelectStudy = useCallback(async (caseId: string) => {
-    // TODO Task 1 — implement handleSelectStudy()
-    console.warn('Task 1 not yet implemented')
-    setStatus('Task 1: Study Selector — not yet implemented')
-  }, [])
+    if (!ready) return
+    if (activeStudy === caseId) return
+
+    try {
+      setStatus(`Loading ${caseId}...`)
+      const n = await loadStudy(caseId, (loaded, total) => {
+        setStatus(`Loading ${caseId}… ${loaded}/${total}`)
+      })
+      setActiveStudy(caseId)
+      setAiSegPath(null)
+      setSegments([])
+      setInfo(prev => ({ ...prev, slice: String(Math.floor(n / 2) + 1), total: String(n) }))
+      setStatus(`Loaded ${caseId} (${n} slices)`)
+    } catch (err) {
+      console.error('Failed to load study:', err)
+      setStatus(`Failed to load ${caseId}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }, [activeStudy, ready])
 
   // ---------------------------------------------------------------------------
   // TASK 2 — Load Ground Truth Annotations
@@ -220,12 +237,162 @@ export default function App() {
   // See HACKATHON_TASKS.md § Task 2 for hints.
   //
   const handleLoadGT = useCallback(async () => {
-    // TODO Task 2 — implement handleLoadGT()
-    console.warn('Task 2 not yet implemented')
-    setStatus('Task 2: Load Ground Truth — not yet implemented')
-  }, [activeStudy])
+    if (!ready) return
+    if (!activeStudy) {
+      setStatus('Select a study first')
+      return
+    }
 
-  // ---------------------------------------------------------------------------
+    const study = LIDC_STUDIES.find(s => s.id === activeStudy)
+    if (!study) {
+      setStatus(`Unknown study: ${activeStudy}`)
+      return
+    }
+
+    const imageIds = getImageIds()
+    if (imageIds.length === 0) {
+      setStatus('No CT stack loaded')
+      return
+    }
+
+    const groupSelector = viewportRef.current
+    if (!groupSelector) {
+      setStatus('Viewport not ready')
+      return
+    }
+
+    try {
+      setStatus(`Loading GT XML for ${activeStudy}...`)
+      const xmlPath = `/data/${activeStudy}/annotations/${study.xml}`
+      const response = await fetch(xmlPath)
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+
+      const xmlText = await response.text()
+      const doc = new DOMParser().parseFromString(xmlText, 'application/xml')
+      const ns = doc.documentElement.namespaceURI || 'http://www.nih.gov'
+
+      const roiElements = Array.from(doc.getElementsByTagNameNS(ns, 'roi'))
+      if (roiElements.length === 0) {
+        setStatus('No ROI contours found in XML')
+        return
+      }
+
+      const slices = imageIds
+        .map(imageId => {
+          const plane = metaData.get('imagePlaneModule', imageId) as
+            | { imagePositionPatient?: [number, number, number] }
+            | undefined
+          const z = Number(plane?.imagePositionPatient?.[2])
+          return Number.isFinite(z) ? { imageId, z } : null
+        })
+        .filter((s): s is { imageId: string; z: number } => s !== null)
+        .sort((a, b) => a.z - b.z)
+
+      if (slices.length === 0) {
+        throw new Error('Slice z-positions are unavailable')
+      }
+
+      const getNearestImageId = (z: number) => {
+        let lo = 0
+        let hi = slices.length - 1
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1
+          if (slices[mid].z < z) lo = mid + 1
+          else hi = mid
+        }
+        if (lo === 0) return slices[0].imageId
+        const prev = slices[lo - 1]
+        const curr = slices[lo]
+        return Math.abs(prev.z - z) <= Math.abs(curr.z - z) ? prev.imageId : curr.imageId
+      }
+
+      const readText = (el: Element, tagName: string): string | null => {
+        const nsMatch = el.getElementsByTagNameNS(ns, tagName)[0]
+        if (nsMatch?.textContent) return nsMatch.textContent
+        const anyNsMatch = el.getElementsByTagNameNS('*', tagName)[0]
+        if (anyNsMatch?.textContent) return anyNsMatch.textContent
+        return null
+      }
+
+      let loaded = 0
+      let skipped = 0
+
+      for (const roi of roiElements) {
+        const zText = readText(roi, 'imageZposition')
+        const z = Number(zText)
+        if (!Number.isFinite(z)) {
+          skipped += 1
+          continue
+        }
+
+        const edgeMaps = Array.from(roi.getElementsByTagNameNS(ns, 'edgeMap'))
+        if (edgeMaps.length < 3) {
+          skipped += 1
+          continue
+        }
+
+        const referencedImageId = getNearestImageId(z)
+        const contour: [number, number, number][] = []
+
+        for (const edge of edgeMaps) {
+          const x = Number(readText(edge, 'xCoord'))
+          const y = Number(readText(edge, 'yCoord'))
+          if (!Number.isFinite(x) || !Number.isFinite(y)) continue
+
+          const world = utilities.imageToWorldCoords(referencedImageId, [y, x]) as [number, number, number]
+          contour.push([world[0], world[1], z])
+        }
+
+        if (contour.length < 3) {
+          skipped += 1
+          continue
+        }
+
+        const plane = metaData.get('imagePlaneModule', referencedImageId) as
+          | { frameOfReferenceUID?: string }
+          | undefined
+
+        annotation.state.addAnnotation(
+          {
+            highlighted: false,
+            invalidated: true,
+            metadata: {
+              toolName: PlanarFreehandROITool.toolName,
+              referencedImageId,
+              FrameOfReferenceUID: plane?.frameOfReferenceUID,
+            },
+            data: {
+              label: `GT contour ${loaded + 1}`,
+              contour: {
+                closed: true,
+                polyline: contour,
+              },
+              handles: {
+                points: contour,
+              },
+              cachedStats: {},
+            },
+          },
+          groupSelector
+        )
+
+        loaded += 1
+      }
+
+      const re = getRenderingEngine()
+      const vp = re?.getViewport(VIEWPORT_ID) as any
+      vp?.render?.()
+
+      const all = annotation.state.getAllAnnotations()
+      setAnnotations(all.map(a => ({ uid: a.annotationUID ?? '', type: a.metadata?.toolName ?? '' })))
+      setStatus(`Loaded ${loaded} GT contour${loaded === 1 ? '' : 's'}${skipped ? ` (${skipped} skipped)` : ''}`)
+    } catch (err) {
+      console.error('Failed to load GT annotations:', err)
+      setStatus(`Failed to load GT: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }, [activeStudy, ready])
+
+   // ---------------------------------------------------------------------------
   // TASK 3 — Run AI Segmentation Model
   // ---------------------------------------------------------------------------
   // Trigger TotalSegmentator or MONAI Label on the active study's CT data and
@@ -234,9 +401,29 @@ export default function App() {
   // See HACKATHON_TASKS.md § Task 3 for hints and available scripts.
   //
   const handleRunAI = useCallback(async () => {
-    // TODO Task 3 — implement handleRunAI()
-    console.warn('Task 3 not yet implemented')
-    setStatus('Task 3: Run AI Segmentation — not yet implemented')
+    if (!activeStudy) {
+      setStatus('No study selected')
+      return
+    }
+  
+    try {
+      setStatus(`Running AI segmentation for ${activeStudy}...`)
+    
+      const res = await fetch(`http://localhost:8000/segment`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ case_id: activeStudy })
+      })
+    
+      if (!res.ok) throw new Error('AI failed')
+      
+      const result = await res.json()
+      setAiSegPath(typeof result.seg_path === 'string' ? result.seg_path : null)
+      setStatus(`AI completed: ${result.seg_path}`)
+    } catch (err) {
+      console.error(err)
+      setStatus('AI segmentation failed')
+    }
   }, [activeStudy])
 
   // ---------------------------------------------------------------------------
@@ -249,10 +436,116 @@ export default function App() {
   // See HACKATHON_TASKS.md § Task 4 for hints.
   //
   const handleShowAISeg = useCallback(async () => {
-    // TODO Task 4 — implement handleShowAISeg()
-    console.warn('Task 4 not yet implemented')
-    setStatus('Task 4: Show AI Segmentation — not yet implemented')
-  }, [activeStudy])
+    if (!ready) return
+    
+    if (!activeStudy) {
+      setStatus('Select a study first')
+      return
+    }
+  
+    try {
+      setStatus(`Loading AI segmentation for ${activeStudy}...`)
+
+      const fallbackSegPath = `data/${activeStudy}/annotations/${activeStudy}_lung_nodules_seg.dcm`
+      const segPath = (aiSegPath ?? fallbackSegPath).replace(/^\/+/, '')
+      const segUrl = `/${segPath}`
+
+      const segResponse = await fetch(segUrl)
+      if (!segResponse.ok) throw new Error(`SEG fetch failed: HTTP ${segResponse.status}`)
+
+      const segBytes = new Uint8Array(await segResponse.arrayBuffer())
+      const segDataSet = dicomParser.parseDicom(segBytes)
+      const numberOfFrames = Number(segDataSet.string('x00280008') ?? '1')
+      if (!Number.isFinite(numberOfFrames) || numberOfFrames <= 0) {
+        throw new Error('SEG NumberOfFrames is invalid')
+      }
+
+      const ctImageIds = getImageIds()
+      if (ctImageIds.length === 0) {
+        throw new Error('No CT stack loaded')
+      }
+
+      if (numberOfFrames !== ctImageIds.length) {
+        throw new Error(`SEG frames (${numberOfFrames}) do not match CT slices (${ctImageIds.length})`)
+      }
+
+      const segImageIds = Array.from(
+        { length: numberOfFrames },
+        (_, i) => `wadouri:${segUrl}?frame=${i + 1}`
+      )
+
+      const segmentationId = `seg-${activeStudy}`
+
+      try {
+        segmentation.removeSegmentationRepresentations(VIEWPORT_ID, { segmentationId })
+      } catch {
+        // no existing representation to remove
+      }
+      try {
+        segmentation.state.removeSegmentation(segmentationId)
+      } catch {
+        // no existing segmentation state to remove
+      }
+
+      segmentation.state.addSegmentations([
+        {
+          segmentationId,
+          representation: {
+            type: ToolEnums.SegmentationRepresentations.Labelmap,
+            data: {
+              imageIds: segImageIds,
+            },
+          },
+        },
+      ])
+
+      segmentation.addLabelmapRepresentationToViewportMap({
+        [VIEWPORT_ID]: [{ segmentationId }],
+      })
+
+      const segmentSeq = segDataSet.elements.x00620002
+      const palette = [
+        [230, 57, 70],
+        [69, 123, 157],
+        [42, 157, 143],
+        [233, 196, 106],
+        [244, 162, 97],
+        [168, 218, 220],
+      ]
+      const loadedSegments: SegmentEntry[] = []
+      if (segmentSeq?.items?.length) {
+        segmentSeq.items.forEach((item: any, idx: number) => {
+          const ds = item?.dataSet
+          const segmentNumber = Number(ds?.uint16?.('x00620004') ?? idx + 1)
+          const segmentLabel = ds?.string?.('x00620005')?.trim() || `Segment ${segmentNumber}`
+          loadedSegments.push({
+            index: segmentNumber,
+            label: segmentLabel,
+            color: palette[idx % palette.length],
+          })
+        })
+      } else {
+        loadedSegments.push({
+          index: 1,
+          label: 'AI Segmentation',
+          color: [230, 57, 70],
+        })
+      }
+      setSegments(loadedSegments)
+
+      const re = getRenderingEngine()
+      const viewport = re?.getViewport(VIEWPORT_ID)
+
+      if (!viewport) throw new Error('Viewport not available')
+
+      viewport.render()
+
+      setStatus(`AI segmentation displayed for ${activeStudy}`)
+    } catch (err) {
+      console.error('Failed to load AI segmentation:', err)
+      setStatus(`Failed to show AI segmentation: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }, [activeStudy, aiSegPath, ready])
 
   // ---------------------------------------------------------------------------
   // BONUS A — AI-Assisted Segmentation
@@ -389,7 +682,19 @@ export default function App() {
           {/* ── TASK 1: Study Selector — implement handleSelectStudy() ── */}
           <h3 style={{ borderTop: '1px solid var(--border)' }}>Studies</h3>
           <div className="list-content">
-            <p className="empty">Task 1: implement study selector</p>
+            {LIDC_STUDIES.map(study => (
+              <button
+                key={study.id}
+                type="button"
+                disabled={!ready}
+                className={`study-item ${activeStudy === study.id ? 'selected' : ''}`}
+                onClick={() => handleSelectStudy(study.id)}
+                title={`Load ${study.id}`}
+              >
+                <span className="study-id">{study.id}</span>
+                <span className="study-meta">{study.slices} slices • {study.xml}</span>
+              </button>
+            ))}
           </div>
         </div>
 
