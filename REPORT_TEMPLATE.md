@@ -25,9 +25,10 @@ My overall strategy was to first complete the study loading workflow (Task 1), t
 For each task you attempted, briefly describe what you did, what surprised you, and any tradeoffs you made. Skip tasks you did not attempt — or leave a one-line note on why.
 
 ### Task 1 — Study Selector
-
+ ![task1 loaded with the case](img/task1.png)
 I implemented a study selector panel using the provided metadata. Each study was rendered as a clickable element in the sidebar, and selecting a study triggered the loadStudy() function to load its CT slices into the viewer.
 
+![task1 with a selected study](img/task1-selected.png)
 The selected study ID was stored in the activeStudy state so that other tasks (such as loading annotations or segmentations) could reference the currently loaded dataset. The UI also updates the viewer status and slice information after loading.
 
 One edge case I considered was switching studies while annotations or segmentations from a previous study were present. To avoid conflicts, I cleared segmentation paths and segment lists when a new study was loaded.
@@ -35,6 +36,7 @@ One edge case I considered was switching studies while annotations or segmentati
 A challenge here was ensuring that the viewer state and UI state remained synchronized after loading a new dataset.
 
 ### Task 2 — Load Ground Truth
+![task2 loaded all the GT](img/task2.png)
 For Task 2, I attempted to load the LIDC ground truth annotations stored as XML files and convert them into PlanarFreehandROI annotations in Cornerstone3D.
 
 The XML file was fetched from the dataset folder and parsed using the browser DOMParser. Because the XML uses a namespace, namespace-aware queries were used to retrive the elements and their corresponding <edgemap> contour points. 
@@ -48,6 +50,8 @@ Due to time constraints, I was not able to fully debug this issue, so the ground
 ### Task 3 — Run AI Segmentation
 For Task 3, I implemented a connection between the frontend and a backend segmentation service using a FastAPI server provided in the repository.
 
+![task3 ui](img/task3-ui.png)
+![task3 server side](img/task3-server.png)
 When the Run AI button is clicked, the application sends a POST request to the segmentation endpoint:
 ```bash
 POST http://localhost:8000/segement
@@ -58,6 +62,7 @@ The frontend stores this returned path in the aiSegPath state so it can later be
 The main challenge was ensuring proper communication between the frontend and backend, including handling cases where the server is not running or the request fails.
 
 ### Task 4 — Display AI Segmentation
+![task4](img/task4.png)
 For Task 4, I began implementing the logic required to load and display a DICOM SEG segmentation file as an overlay on the CT images.
 
 The goal was to load the segmentation file returned by Task 3 and use the Cornerstone segmentation API to create a labelmap representation that could be rendered on the viewer. This would allow the segmentation masks to appear as colored overlays aligned with the CT slices.
